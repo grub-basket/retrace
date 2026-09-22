@@ -337,6 +337,12 @@ public actor WALManager {
         }
     }
 
+    /// Persist all live frames and their ID mappings before abandoning a video.
+    /// Failure leaves the memory copy available and must prevent video deletion.
+    public func persistSessionForRecovery(videoID: VideoSegmentID) async throws {
+        try await spillMemorySessionToDiskIfNeeded(videoID: videoID)
+    }
+
     /// Finalize a WAL session (after successful video encoding)
     public func finalizeSession(_ session: WALSession) async throws {
         // Delete the WAL directory - video is now safely encoded
