@@ -38,6 +38,44 @@ public actor WALManager {
     private static let discardableQuarantinePrefix = "quarantined_segment_"
     private static let retainedQuarantinePrefix = "retained_segment_"
 
+    // MARK: - Memory-backed WAL
+    //
+    // The WAL protects frames until they are durable in the fragmented MP4
+    // (fragments flush every 0.1s of video time, i.e. every ~3 frames) and lets
+    // OCR read the in-progress segment. Writing every frame to disk for that
+    // was ~100GB+/day of write churn at 4K. With compressed payloads a whole
+    // 150-frame segment is ~150-250MB, so the in-progress segment is held in
+    // memory instead and NOTHING pixel-sized touches disk in the happy path.
+    //
+    // Crash semantics: on crash the in-memory frames are lost, so the session
+    // directory is found with frameCount>0 but an empty frames.bin. Recovery
+    // already handles exactly that state ("no recoverable WAL frames; preserving
+    // the durable fMP4 prefix"); at most the last un-flushed ~3 frames are
+    // dropped. A normal relaunch never resumes an old session (a fresh writer
+    // and session are created), so a memory-backed session behaves like a
+    // crash on relaunch. Sessions never change mode mid-life, which keeps frame
+    // indices aligned with the on-disk offset index for disk-backed sessions.
+    //
+    // Set to false to restore the disk-backed (compressed) WAL.
+    private static let memoryWALEnabled = true
+    /// Soft budget across all live memory-backed sessions, checked at session
+    /// creation. Sessions created while over budget fall back to disk.
+    private static let memoryWALBudgetBytes: Int64 = 768 * 1024 * 1024
+
+    private struct WALMemoryFrame {
+        let payload: Data          // compressed (JPEG), or raw BGRA on encode fallback
+        let timestamp: Double
+        let width: Int
+        let height: Int
+        let bytesPerRow: Int
+        let metadata: FrameMetadata
+    }
+
+    private var memoryBackedSessions: Set<Int64> = []
+    private var memoryFramesByVideoID: [Int64: [Int: WALMemoryFrame]] = [:]
+    private var memoryFrameIndexByFrameID: [Int64: [Int64: Int]] = [:]
+    private var memoryBytesInUse: Int64 = 0
+
     public init(walRoot: URL) {
         self.walRootURL = walRoot
     }
@@ -121,6 +159,17 @@ public actor WALManager {
             )
         }
 
+        if Self.memoryWALEnabled, memoryBytesInUse < Self.memoryWALBudgetBytes {
+            memoryBackedSessions.insert(videoID.value)
+            memoryFramesByVideoID[videoID.value] = [:]
+            memoryFrameIndexByFrameID[videoID.value] = [:]
+        } else if Self.memoryWALEnabled {
+            Log.warning(
+                "[WAL] Memory-backed WAL budget exhausted (\(memoryBytesInUse) bytes in use); session \(videoID.value) will be disk-backed",
+                category: .storage
+            )
+        }
+
         return WALSession(
             videoID: videoID,
             sessionDir: sessionDir,
@@ -131,6 +180,11 @@ public actor WALManager {
 
     /// Append a frame to the WAL
     public func appendFrame(_ frame: CapturedFrame, to session: inout WALSession) async throws {
+        if memoryBackedSessions.contains(session.videoID.value) {
+            appendFrameToMemory(frame, to: &session)
+            return
+        }
+
         // Open file handle for appending
         guard let fileHandle = FileHandle(forWritingAtPath: session.framesURL.path) else {
             throw StorageError.fileWriteFailed(
@@ -289,6 +343,12 @@ public actor WALManager {
                 path: "WAL(\(videoID.value))",
                 underlying: "Cannot register negative frame index \(frameIndex)"
             )
+        }
+        if memoryBackedSessions.contains(videoID.value) {
+            // Memory-backed sessions have no byte offsets; map frameID -> index in memory.
+            // (The disk map path below would throw because frames.bin is empty.)
+            memoryFrameIndexByFrameID[videoID.value, default: [:]][frameID] = frameIndex
+            return
         }
 
         let sessionDir = walRootURL.appendingPathComponent("active_segment_\(videoID.value)")
@@ -587,6 +647,13 @@ public actor WALManager {
     /// Returns recoverable frame count for an active WAL directory if present.
     /// - Returns: `nil` when no active WAL directory exists for `videoID`.
     public func recoverableFrameCountIfPresent(videoID: VideoSegmentID) async throws -> Int? {
+        if memoryBackedSessions.contains(videoID.value) {
+            // Live memory-backed session: report the in-memory count so callers that
+            // refuse to delete a session holding frames (finalizeSessionDirectoryIfPresent,
+            // stale-WAL cleanup) keep protecting it even though frames.bin is empty on disk.
+            return memoryFramesByVideoID[videoID.value]?.count ?? 0
+        }
+
         let sessionDir = walRootURL.appendingPathComponent("active_segment_\(videoID.value)")
         guard FileManager.default.fileExists(atPath: sessionDir.path) else {
             return nil
@@ -716,6 +783,7 @@ public actor WALManager {
         try FileManager.default.moveItem(at: session.sessionDir, to: destinationURL)
         frameOffsetIndexCache.removeValue(forKey: session.videoID.value)
         frameIDOffsetIndexCache.removeValue(forKey: session.videoID.value)
+        dropMemorySession(session.videoID.value)
 
         Log.warning(
             "[WAL] \(disposition.logLabel) session \(session.videoID.value) to \(destinationURL.lastPathComponent): \(reason)",
@@ -727,6 +795,11 @@ public actor WALManager {
 
     /// Read all frames from a WAL session
     public func readFrames(from session: WALSession) async throws -> [CapturedFrame] {
+        if memoryBackedSessions.contains(session.videoID.value) {
+            let frames = memoryFramesByVideoID[session.videoID.value] ?? [:]
+            return try frames.keys.sorted().map { try Self.makeCapturedFrame(fromMemory: frames[$0]!) }
+        }
+
         let fileSize = try await framesFileSize(for: session)
         if fileSize > Self.eagerReadSafetyLimitBytes {
             throw StorageError.fileReadFailed(
@@ -752,6 +825,18 @@ public actor WALManager {
     /// Active-session reads require a persisted frameID map entry so OCR never
     /// silently falls back to a drifted capture index.
     public func readFrame(videoID: VideoSegmentID, frameID: Int64, fallbackFrameIndex: Int) async throws -> CapturedFrame {
+        if memoryBackedSessions.contains(videoID.value) {
+            // Preserve the no-index-fallback contract: require a registered frameID.
+            guard let frameIndex = memoryFrameIndexByFrameID[videoID.value]?[frameID],
+                  let memoryFrame = memoryFramesByVideoID[videoID.value]?[frameIndex] else {
+                throw StorageError.fileReadFailed(
+                    path: "WAL(\(videoID.value))",
+                    underlying: "Incomplete in-memory WAL frameID map for frameID \(frameID); refusing fallback to frame index \(fallbackFrameIndex)"
+                )
+            }
+            return try Self.makeCapturedFrame(fromMemory: memoryFrame)
+        }
+
         let sessionDir = walRootURL.appendingPathComponent("active_segment_\(videoID.value)")
         let framesURL = sessionDir.appendingPathComponent("frames.bin")
         let mapURL = sessionDir.appendingPathComponent("frame_id_map.bin")
@@ -788,6 +873,15 @@ public actor WALManager {
                 path: "WAL(\(videoID.value))",
                 underlying: "Frame index \(frameIndex) is negative"
             )
+        }
+        if memoryBackedSessions.contains(videoID.value) {
+            guard let memoryFrame = memoryFramesByVideoID[videoID.value]?[frameIndex] else {
+                throw StorageError.fileReadFailed(
+                    path: "WAL(\(videoID.value))",
+                    underlying: "Frame index \(frameIndex) not present in memory-backed WAL"
+                )
+            }
+            return try Self.makeCapturedFrame(fromMemory: memoryFrame)
         }
 
         let sessionDir = walRootURL.appendingPathComponent("active_segment_\(videoID.value)")
@@ -1357,6 +1451,75 @@ public actor WALManager {
         return (data, cgImage.width, cgImage.height, cgImage.width * 4)
     }
 
+    // MARK: - Memory-backed WAL helpers
+
+    private func appendFrameToMemory(_ frame: CapturedFrame, to session: inout WALSession) {
+        let payload = Self.encodeWALPayload(frame) ?? frame.imageData
+        let frameIndex = session.metadata.frameCount
+        memoryFramesByVideoID[session.videoID.value, default: [:]][frameIndex] = WALMemoryFrame(
+            payload: payload,
+            timestamp: frame.timestamp.timeIntervalSince1970,
+            width: frame.width,
+            height: frame.height,
+            bytesPerRow: frame.bytesPerRow,
+            metadata: frame.metadata
+        )
+        memoryBytesInUse += Int64(payload.count)
+
+        // Mirror the disk path's metadata bookkeeping so recovery, durable-state
+        // updates and resume checks observe the same frameCount/width/height.
+        session.metadata.frameCount += 1
+        if session.metadata.width == 0 {
+            session.metadata.width = frame.width
+            session.metadata.height = frame.height
+        }
+        do {
+            try saveMetadata(session.metadata, to: session.sessionDir)
+        } catch {
+            Log.warning(
+                "[WAL] Failed to update metadata sidecar for memory-backed session \(session.videoID.value): \(error.localizedDescription)",
+                category: .storage
+            )
+        }
+    }
+
+    private func dropMemorySession(_ videoIDValue: Int64) {
+        guard memoryBackedSessions.remove(videoIDValue) != nil else { return }
+        if let frames = memoryFramesByVideoID.removeValue(forKey: videoIDValue) {
+            let released = frames.values.reduce(Int64(0)) { $0 + Int64($1.payload.count) }
+            memoryBytesInUse = max(0, memoryBytesInUse - released)
+        }
+        memoryFrameIndexByFrameID.removeValue(forKey: videoIDValue)
+    }
+
+    /// Rebuild a CapturedFrame (raw BGRA) from an in-memory WAL frame, decoding
+    /// the compressed payload when present. Mirrors the on-disk read path.
+    private static func makeCapturedFrame(fromMemory memoryFrame: WALMemoryFrame) throws -> CapturedFrame {
+        let payload = memoryFrame.payload
+        let rawSize = memoryFrame.bytesPerRow * memoryFrame.height
+        let isCompressed = payload.count != rawSize
+            && payload.count >= jpegMagic.count
+            && payload.prefix(jpegMagic.count).elementsEqual(jpegMagic)
+        if isCompressed, let decoded = try? decodeWALPayload(payload) {
+            return CapturedFrame(
+                timestamp: Date(timeIntervalSince1970: memoryFrame.timestamp),
+                imageData: decoded.data,
+                width: decoded.width,
+                height: decoded.height,
+                bytesPerRow: decoded.bytesPerRow,
+                metadata: memoryFrame.metadata
+            )
+        }
+        return CapturedFrame(
+            timestamp: Date(timeIntervalSince1970: memoryFrame.timestamp),
+            imageData: payload,
+            width: memoryFrame.width,
+            height: memoryFrame.height,
+            bytesPerRow: memoryFrame.bytesPerRow,
+            metadata: memoryFrame.metadata
+        )
+    }
+
     private func currentOffset(fileHandle: FileHandle) -> UInt64 {
         if #available(macOS 10.15.4, *) {
             return (try? fileHandle.offset()) ?? 0
@@ -1393,6 +1556,7 @@ public actor WALManager {
     private func clearSessionCaches(videoIDValue: Int64) {
         frameOffsetIndexCache.removeValue(forKey: videoIDValue)
         frameIDOffsetIndexCache.removeValue(forKey: videoIDValue)
+        dropMemorySession(videoIDValue)
     }
 
     private func readOptionalString(
