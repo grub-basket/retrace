@@ -126,6 +126,52 @@ final class WALManagerPayloadTests: XCTestCase {
         }
     }
 
+    func testFailedFrameSpillPreservesMemoryAndCanRetry() async throws {
+        try await assertFailedSpillCanRetry(blockedName: "frames.bin")
+    }
+
+    func testFailedMapSpillPreservesMemoryAndCanRetry() async throws {
+        try await assertFailedSpillCanRetry(blockedName: "frame_id_map.bin")
+    }
+
+    private func assertFailedSpillCanRetry(blockedName: String) async throws {
+        let wal = WALManager(walRoot: walRoot)
+        var session = try await wal.createSession(videoID: VideoSegmentID(value: 5))
+        let first = Self.makeGradientFrame(width: 64, height: 64, seed: 20)
+        let second = Self.makeGradientFrame(width: 64, height: 64, seed: 80)
+        try await wal.appendFrame(first, to: &session)
+        try await wal.registerFrameID(videoID: session.videoID, frameID: 101, frameIndex: 0)
+
+        // Use a real filesystem failure, including a late failure after frames
+        // have been written but the frame-ID map cannot be published.
+        let blockedURL = session.sessionDir.appendingPathComponent(blockedName)
+        try FileManager.default.removeItem(at: blockedURL)
+        try FileManager.default.createDirectory(at: blockedURL, withIntermediateDirectories: false)
+        try Data([1]).write(to: blockedURL.appendingPathComponent("blocker"))
+        do {
+            _ = try await wal.recoverableFrameCountIfPresent(videoID: session.videoID)
+            XCTFail("Spill must report failure when its destination is blocked")
+        } catch {
+            // The complete memory copy must still serve reads and accept appends.
+        }
+        let retained = try await wal.readFrame(videoID: session.videoID, frameID: 101, fallbackFrameIndex: 999)
+        Self.assertPixelsApproximatelyEqual(retained, first, tolerance: 16)
+        try await wal.appendFrame(second, to: &session)
+        try await wal.registerFrameID(videoID: session.videoID, frameID: 102, frameIndex: 1)
+
+        try FileManager.default.removeItem(at: blockedURL)
+        try Data().write(to: blockedURL)
+        let count = try await wal.recoverableFrameCountIfPresent(videoID: session.videoID)
+        XCTAssertEqual(count, 2, "Retry must replace partial spill output, never append duplicates")
+
+        // A fresh manager has no in-memory frames or cached mappings.
+        let reopened = WALManager(walRoot: walRoot)
+        let readFirst = try await reopened.readFrame(videoID: session.videoID, frameID: 101, fallbackFrameIndex: 999)
+        let readSecond = try await reopened.readFrame(videoID: session.videoID, frameID: 102, fallbackFrameIndex: 999)
+        Self.assertPixelsApproximatelyEqual(readFirst, first, tolerance: 16)
+        Self.assertPixelsApproximatelyEqual(readSecond, second, tolerance: 16)
+    }
+
     // MARK: - Helpers
 
     /// Smooth BGRA gradient: compresses well with low JPEG error, and its size

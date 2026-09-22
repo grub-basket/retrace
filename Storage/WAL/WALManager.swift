@@ -1,4 +1,5 @@
 import CoreGraphics
+import Darwin
 import Foundation
 import ImageIO
 import Shared
@@ -1441,18 +1442,25 @@ public actor WALManager {
 
         let frames = memoryFramesByVideoID[id] ?? [:]
         let frameIDs = memoryFrameIndexByFrameID[id] ?? [:]
-        let framesURL = walRootURL
-            .appendingPathComponent("active_segment_\(id)")
-            .appendingPathComponent("frames.bin")
+        let sessionDir = walRootURL.appendingPathComponent("active_segment_\(id)")
+        let framesURL = sessionDir.appendingPathComponent("frames.bin")
+        let mapURL = sessionDir.appendingPathComponent("frame_id_map.bin")
+        let spillID = UUID().uuidString
+        let stagedFramesURL = sessionDir.appendingPathComponent(".frames-\(spillID).tmp")
+        let stagedMapURL = sessionDir.appendingPathComponent(".frame-map-\(spillID).tmp")
+        defer {
+            try? FileManager.default.removeItem(at: stagedFramesURL)
+            try? FileManager.default.removeItem(at: stagedMapURL)
+        }
 
-        // Convert to disk mode first so the disk append/register paths are used
-        // from here on and no further frames land in memory for this session.
-        dropMemorySession(id)
-
+        // Do not suspend or change modes until both files have been published.
+        // If any write fails, OCR can still read every frame from memory and a
+        // retry replaces the partial spill instead of appending duplicate frames.
+        try createEmptyFile(at: stagedFramesURL)
         for index in frames.keys.sorted() {
             let memoryFrame = frames[index]!
             try writeFrameRecordToDisk(
-                framesURL: framesURL,
+                framesURL: stagedFramesURL,
                 timestamp: memoryFrame.timestamp,
                 width: memoryFrame.width,
                 height: memoryFrame.height,
@@ -1461,12 +1469,40 @@ public actor WALManager {
                 metadata: memoryFrame.metadata
             )
         }
-        frameOffsetIndexCache.removeValue(forKey: id)
-
-        // Replay the frameID map now that byte offsets exist on disk.
-        for (frameID, frameIndex) in frameIDs.sorted(by: { $0.value < $1.value }) {
-            try await registerFrameID(videoID: videoID, frameID: frameID, frameIndex: frameIndex)
+        let fileSize = try FileManager.default.attributesOfItem(atPath: stagedFramesURL.path)[.size] as? NSNumber
+        let offsets = try buildFrameOffsetIndex(
+            framesURL: stagedFramesURL,
+            currentFileSize: fileSize?.int64Value ?? 0
+        )
+        let records = try frameIDs.sorted(by: { $0.value < $1.value }).map { frameID, frameIndex in
+            guard offsets.indices.contains(frameIndex) else {
+                throw StorageError.fileWriteFailed(
+                    path: mapURL.path,
+                    underlying: "Cannot spill frameID \(frameID): frame index \(frameIndex) is missing"
+                )
+            }
+            return WALFrameIDMapRecord(frameID: frameID, frameOffset: offsets[frameIndex])
         }
+        // Unlike best-effort registration during capture, every mapping must be
+        // written successfully before the in-memory recovery copy can be dropped.
+        try replaceFrameIDMapFile(at: stagedMapURL, with: records)
+        for url in [stagedFramesURL, stagedMapURL] {
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.synchronize()
+        }
+        for (stagedURL, destinationURL) in [(stagedFramesURL, framesURL), (stagedMapURL, mapURL)] {
+            guard rename(stagedURL.path, destinationURL.path) == 0 else {
+                throw makeStorageWriteError(
+                    path: destinationURL.path,
+                    error: NSError(domain: NSPOSIXErrorDomain, code: Int(errno)),
+                    fallback: "Failed to publish WAL spill"
+                )
+            }
+        }
+        frameOffsetIndexCache.removeValue(forKey: id)
+        frameIDOffsetIndexCache.removeValue(forKey: id)
+        dropMemorySession(id)
 
         Log.info(
             "[WAL] Spilled memory-backed session \(id) to disk (\(frames.count) frames)",
