@@ -1,4 +1,6 @@
+import CoreGraphics
 import Foundation
+import ImageIO
 import Shared
 
 public enum WALQuarantineDisposition: Sendable {
@@ -146,13 +148,22 @@ public actor WALManager {
                 fileHandle.seekToEndOfFile()
             }
 
+            // Compress the pixel payload before it touches disk. Raw BGRA at 4K is
+            // ~33MB/frame and the WAL is rewritten every segment (~5 min) then
+            // deleted, so the raw copy was pure write churn (~100GB+/day of SSD
+            // writes). JPEG at 0.9 is ~20-30x smaller and still OCR-friendly.
+            // The header layout is unchanged: readers detect a compressed payload
+            // by (dataSize != bytesPerRow*height) + the JPEG magic, so pre-existing
+            // raw frames.bin files remain readable. Falls back to raw on encode failure.
+            let payload = Self.encodeWALPayload(frame) ?? frame.imageData
+
             // Write frame header + pixel data
             let header = WALFrameHeader(
                 timestamp: frame.timestamp.timeIntervalSince1970,
                 width: UInt32(frame.width),
                 height: UInt32(frame.height),
                 bytesPerRow: UInt32(frame.bytesPerRow),
-                dataSize: UInt32(frame.imageData.count),
+                dataSize: UInt32(payload.count),
                 displayID: frame.metadata.displayID,
                 appBundleIDLength: UInt16(frame.metadata.appBundleID?.utf8.count ?? 0),
                 appNameLength: UInt16(frame.metadata.appName?.utf8.count ?? 0),
@@ -209,11 +220,11 @@ public actor WALManager {
                 }
             }
 
-            // Write pixel data
+            // Write pixel data (compressed payload, or raw on encode fallback)
             if #available(macOS 10.15.4, *) {
-                try fileHandle.write(contentsOf: frame.imageData)
+                try fileHandle.write(contentsOf: payload)
             } else {
-                fileHandle.write(frame.imageData)
+                fileHandle.write(payload)
             }
         } catch {
             throw makeStorageWriteError(
@@ -1240,20 +1251,110 @@ public actor WALManager {
             label: "pixel data at offset \(frameOffset)"
         )
 
+        let metadata = FrameMetadata(
+            appBundleID: appBundleID,
+            appName: appName,
+            windowName: windowName,
+            browserURL: browserURL,
+            displayID: header.displayID
+        )
+
+        // Newer WAL frames store a compressed (JPEG) payload; older ones store raw
+        // BGRA. Detect by size mismatch + magic and decode back to BGRA so every
+        // consumer (encoder recovery, OCR, timeline) still receives raw pixels.
+        // A detection false-positive that fails to decode falls back to raw.
+        if Self.isCompressedWALPayload(pixelData, header: header),
+           let decoded = try? Self.decodeWALPayload(pixelData) {
+            return CapturedFrame(
+                timestamp: Date(timeIntervalSince1970: header.timestamp),
+                imageData: decoded.data,
+                width: decoded.width,
+                height: decoded.height,
+                bytesPerRow: decoded.bytesPerRow,
+                metadata: metadata
+            )
+        }
+
         return CapturedFrame(
             timestamp: Date(timeIntervalSince1970: header.timestamp),
             imageData: pixelData,
             width: Int(header.width),
             height: Int(header.height),
             bytesPerRow: Int(header.bytesPerRow),
-            metadata: FrameMetadata(
-                appBundleID: appBundleID,
-                appName: appName,
-                windowName: windowName,
-                browserURL: browserURL,
-                displayID: header.displayID
-            )
+            metadata: metadata
         )
+    }
+
+    // MARK: - WAL payload compression
+
+    /// JPEG quality for WAL frame payloads. Higher than the timeline still cache
+    /// (0.8) because these frames feed OCR and crash-recovery re-encoding.
+    private static let walJPEGCompressionQuality: CGFloat = 0.9
+    private static let jpegMagic: [UInt8] = [0xFF, 0xD8, 0xFF]
+
+    /// Build a CGImage view over a captured frame's BGRA buffer (premultipliedFirst,
+    /// little-endian 32-bit -- the same layout BGRAImageUtilities.makeData produces).
+    private static func makeCGImage(fromBGRA frame: CapturedFrame) -> CGImage? {
+        guard frame.width > 0, frame.height > 0, frame.bytesPerRow > 0 else { return nil }
+        let bitmapInfo = CGBitmapInfo(
+            rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        )
+        guard let provider = CGDataProvider(data: frame.imageData as CFData) else { return nil }
+        return CGImage(
+            width: frame.width,
+            height: frame.height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: frame.bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: bitmapInfo,
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        )
+    }
+
+    /// JPEG-encode a frame for WAL storage. Returns nil (caller writes raw) if
+    /// encoding fails or would not actually shrink the payload, and guarantees the
+    /// result can never be mistaken for a raw payload of the same dimensions.
+    private static func encodeWALPayload(_ frame: CapturedFrame) -> Data? {
+        guard let cgImage = makeCGImage(fromBGRA: frame) else { return nil }
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            output as CFMutableData,
+            "public.jpeg" as CFString,
+            1,
+            nil
+        ) else { return nil }
+        CGImageDestinationAddImage(
+            destination,
+            cgImage,
+            [kCGImageDestinationLossyCompressionQuality: walJPEGCompressionQuality] as CFDictionary
+        )
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        let data = output as Data
+        let rawSize = frame.bytesPerRow * frame.height
+        guard data.count < frame.imageData.count, data.count != rawSize else { return nil }
+        return data
+    }
+
+    /// A payload is compressed iff it is not exactly raw-sized AND starts with the
+    /// JPEG SOI marker. Future codecs (e.g. JPEG XL) can be added here by magic.
+    private static func isCompressedWALPayload(_ payload: Data, header: WALFrameHeader) -> Bool {
+        let rawSize = Int(header.bytesPerRow) * Int(header.height)
+        guard payload.count != rawSize, payload.count >= jpegMagic.count else { return false }
+        return payload.prefix(jpegMagic.count).elementsEqual(jpegMagic)
+    }
+
+    /// Decode a compressed WAL payload back to a BGRA buffer (bytesPerRow = width*4).
+    private static func decodeWALPayload(_ payload: Data) throws -> (data: Data, width: Int, height: Int, bytesPerRow: Int) {
+        guard let source = CGImageSourceCreateWithData(payload as CFData, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw StorageError.fileReadFailed(path: "", underlying: "Failed to decode compressed WAL frame payload")
+        }
+        let data = try BGRAImageUtilities.makeData(from: cgImage)
+        return (data, cgImage.width, cgImage.height, cgImage.width * 4)
     }
 
     private func currentOffset(fileHandle: FileHandle) -> UInt64 {
