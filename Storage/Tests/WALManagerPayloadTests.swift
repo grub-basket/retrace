@@ -172,6 +172,68 @@ final class WALManagerPayloadTests: XCTestCase {
         Self.assertPixelsApproximatelyEqual(readSecond, second, tolerance: 16)
     }
 
+    // MARK: - Budget is a hard bound
+
+    func testAppendBeyondBudgetSpillsSessionToDiskAndContinuesThere() async throws {
+        // 8x8 frames are stored raw (a JPEG would be larger), so each payload is
+        // exactly 256 bytes and the arithmetic below is deterministic.
+        let wal = WALManager(walRoot: walRoot, memoryBudgetBytes: 600)
+        var session = try await wal.createSession(videoID: VideoSegmentID(value: 6))
+        let frames = (0..<4).map { Self.makeGradientFrame(width: 8, height: 8, seed: UInt8($0 * 50)) }
+
+        try await wal.appendFrame(frames[0], to: &session) // 256 in memory
+        try await wal.appendFrame(frames[1], to: &session) // 512 in memory
+        XCTAssertEqual(try Self.fileSize(session.framesURL), 0, "still within budget: nothing on disk")
+
+        try await wal.appendFrame(frames[2], to: &session) // 768 > 600: spill, then disk
+        XCTAssertGreaterThan(
+            try Self.fileSize(session.framesURL),
+            0,
+            "exceeding the budget must spill the session to disk"
+        )
+        try await wal.appendFrame(frames[3], to: &session) // session is disk-backed now
+
+        XCTAssertEqual(session.metadata.frameCount, 4)
+        for index in 0..<4 {
+            let read = try await wal.readFrame(videoID: session.videoID, frameIndex: index)
+            XCTAssertEqual(read.imageData, frames[index].imageData, "frame \(index) must survive the spill intact and in order")
+        }
+        let recoverable = try await wal.recoverableFrameCountIfPresent(videoID: session.videoID)
+        XCTAssertEqual(recoverable, 4)
+    }
+
+    // MARK: - Relaunch without a spill (crash-recovery view)
+
+    func testRelaunchSeesUnspilledMemoryBackedSessionAsEmptyFramesBin() async throws {
+        let wal = WALManager(walRoot: walRoot)
+        var session = try await wal.createSession(videoID: VideoSegmentID(value: 7))
+        try await wal.appendFrame(Self.makeGradientFrame(width: 64, height: 64, seed: 10), to: &session)
+        try await wal.appendFrame(Self.makeGradientFrame(width: 64, height: 64, seed: 20), to: &session)
+
+        // A new manager over the same root simulates a relaunch: the previous
+        // process's memory is gone; only the sidecars and an empty frames.bin remain.
+        let relaunched = WALManager(walRoot: walRoot)
+        let active = try await relaunched.listActiveSessions()
+        let found = active.first { $0.videoID.value == 7 }
+        XCTAssertNotNil(found, "the session directory must still be listed after relaunch")
+        XCTAssertEqual(found?.metadata.frameCount, 2, "metadata sidecar must reflect the appended frames")
+        let recoverable = try await relaunched.recoverableFrameCountIfPresent(videoID: session.videoID)
+        XCTAssertEqual(
+            recoverable,
+            0,
+            "an unspilled memory-backed session leaves no recoverable WAL frames; recovery keeps the durable fMP4 prefix"
+        )
+    }
+
+    // MARK: - Kill switch
+
+    func testDisablingMemoryModeWritesToDisk() async throws {
+        let wal = WALManager(walRoot: walRoot, memoryBackedSessionsEnabled: false)
+        var session = try await wal.createSession(videoID: VideoSegmentID(value: 8))
+        try await wal.appendFrame(Self.makeGradientFrame(width: 64, height: 64, seed: 5), to: &session)
+        XCTAssertGreaterThan(try Self.fileSize(session.framesURL), 0, "disk-backed mode must write frames.bin")
+    }
+
     // MARK: - Helpers
 
     /// Smooth BGRA gradient: compresses well with low JPEG error, and its size

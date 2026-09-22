@@ -64,9 +64,11 @@ public actor WALManager {
     // Memory-backed sessions are the default; pass memoryBackedSessionsEnabled:
     // false to WALManager.init to restore the disk-backed (compressed) WAL.
     private let memoryBackedSessionsEnabled: Bool
-    /// Soft budget across all live memory-backed sessions, checked at session
-    /// creation. Sessions created while over budget fall back to disk.
-    private static let memoryWALBudgetBytes: Int64 = 768 * 1024 * 1024
+    /// Hard budget across all live memory-backed sessions. Checked at session
+    /// creation (admission) AND on every append: an append that would exceed it
+    /// spills that session to disk and continues there, so in-memory usage can
+    /// never grow past the budget.
+    private let memoryBudgetBytes: Int64
 
     private struct WALMemoryFrame {
         let payload: Data          // compressed (JPEG), or raw BGRA on encode fallback
@@ -82,12 +84,20 @@ public actor WALManager {
     private var memoryFrameIndexByFrameID: [Int64: [Int64: Int]] = [:]
     private var memoryBytesInUse: Int64 = 0
 
-    /// - Parameter memoryBackedSessionsEnabled: hold each in-progress segment's
-    ///   frames in memory (no pixel writes to disk). Pass false to restore the
-    ///   disk-backed WAL, e.g. for tests that inspect frames.bin directly.
-    public init(walRoot: URL, memoryBackedSessionsEnabled: Bool = true) {
+    /// - Parameters:
+    ///   - memoryBackedSessionsEnabled: hold each in-progress segment's frames in
+    ///     memory (no pixel writes to disk). Pass false to restore the disk-backed
+    ///     WAL, e.g. for tests that inspect frames.bin directly.
+    ///   - memoryBudgetBytes: hard cap on in-memory frame bytes across all live
+    ///     sessions; an append that would exceed it spills that session to disk.
+    public init(
+        walRoot: URL,
+        memoryBackedSessionsEnabled: Bool = true,
+        memoryBudgetBytes: Int64 = 768 * 1024 * 1024
+    ) {
         self.walRootURL = walRoot
         self.memoryBackedSessionsEnabled = memoryBackedSessionsEnabled
+        self.memoryBudgetBytes = memoryBudgetBytes
     }
 
     public func initialize() async throws {
@@ -169,7 +179,7 @@ public actor WALManager {
             )
         }
 
-        if memoryBackedSessionsEnabled, memoryBytesInUse < Self.memoryWALBudgetBytes {
+        if memoryBackedSessionsEnabled, memoryBytesInUse < memoryBudgetBytes {
             memoryBackedSessions.insert(videoID.value)
             memoryFramesByVideoID[videoID.value] = [:]
             memoryFrameIndexByFrameID[videoID.value] = [:]
@@ -190,30 +200,49 @@ public actor WALManager {
 
     /// Append a frame to the WAL
     public func appendFrame(_ frame: CapturedFrame, to session: inout WALSession) async throws {
-        if memoryBackedSessions.contains(session.videoID.value) {
-            appendFrameToMemory(frame, to: &session)
-            return
-        }
-
-        // Compress the pixel payload before it touches disk. Raw BGRA at 4K is
-        // ~33MB/frame and the WAL is rewritten every segment (~5 min) then
+        // Compress the pixel payload once, for either destination. Raw BGRA at 4K
+        // is ~33MB/frame and the WAL is rewritten every segment (~5 min) then
         // deleted, so the raw copy was pure write churn (~100GB+/day of SSD
         // writes). JPEG at 0.9 is ~20-30x smaller and still OCR-friendly.
         // The header layout is unchanged: readers detect a compressed payload
         // by (dataSize != bytesPerRow*height) + the JPEG magic, so pre-existing
         // raw frames.bin files remain readable. Falls back to raw on encode failure.
         let payload = Self.encodeWALPayload(frame) ?? frame.imageData
-        try writeFrameRecordToDisk(
-            framesURL: session.framesURL,
-            timestamp: frame.timestamp.timeIntervalSince1970,
-            width: frame.width,
-            height: frame.height,
-            bytesPerRow: frame.bytesPerRow,
-            payload: payload,
-            metadata: frame.metadata
-        )
 
-        // Update session metadata
+        var storedInMemory = false
+        if memoryBackedSessions.contains(session.videoID.value) {
+            if memoryBytesInUse + Int64(payload.count) <= memoryBudgetBytes {
+                storeFrameInMemory(
+                    frame,
+                    payload: payload,
+                    frameIndex: session.metadata.frameCount,
+                    videoID: session.videoID.value
+                )
+                storedInMemory = true
+            } else {
+                // Hard budget: materialize this session and continue on disk. The
+                // spill writes every earlier frame in order, so indices stay aligned.
+                Log.warning(
+                    "[WAL] Memory-backed WAL budget (\(memoryBudgetBytes) bytes) would be exceeded by session \(session.videoID.value); spilling it to disk",
+                    category: .storage
+                )
+                try await spillMemorySessionToDiskIfNeeded(videoID: session.videoID)
+            }
+        }
+
+        if !storedInMemory {
+            try writeFrameRecordToDisk(
+                framesURL: session.framesURL,
+                timestamp: frame.timestamp.timeIntervalSince1970,
+                width: frame.width,
+                height: frame.height,
+                bytesPerRow: frame.bytesPerRow,
+                payload: payload,
+                metadata: frame.metadata
+            )
+        }
+
+        // Update session metadata (shared by the memory and disk paths)
         session.metadata.frameCount += 1
         if session.metadata.width == 0 {
             session.metadata.width = frame.width
@@ -1398,10 +1427,15 @@ public actor WALManager {
 
     // MARK: - Memory-backed WAL helpers
 
-    private func appendFrameToMemory(_ frame: CapturedFrame, to session: inout WALSession) {
-        let payload = Self.encodeWALPayload(frame) ?? frame.imageData
-        let frameIndex = session.metadata.frameCount
-        memoryFramesByVideoID[session.videoID.value, default: [:]][frameIndex] = WALMemoryFrame(
+    /// Store one frame's (already-encoded) payload in memory and account for it.
+    /// Metadata bookkeeping is done by appendFrame, shared with the disk path.
+    private func storeFrameInMemory(
+        _ frame: CapturedFrame,
+        payload: Data,
+        frameIndex: Int,
+        videoID: Int64
+    ) {
+        memoryFramesByVideoID[videoID, default: [:]][frameIndex] = WALMemoryFrame(
             payload: payload,
             timestamp: frame.timestamp.timeIntervalSince1970,
             width: frame.width,
@@ -1410,22 +1444,6 @@ public actor WALManager {
             metadata: frame.metadata
         )
         memoryBytesInUse += Int64(payload.count)
-
-        // Mirror the disk path's metadata bookkeeping so recovery, durable-state
-        // updates and resume checks observe the same frameCount/width/height.
-        session.metadata.frameCount += 1
-        if session.metadata.width == 0 {
-            session.metadata.width = frame.width
-            session.metadata.height = frame.height
-        }
-        do {
-            try saveMetadata(session.metadata, to: session.sessionDir)
-        } catch {
-            Log.warning(
-                "[WAL] Failed to update metadata sidecar for memory-backed session \(session.videoID.value): \(error.localizedDescription)",
-                category: .storage
-            )
-        }
     }
 
     private func dropMemorySession(_ videoIDValue: Int64) {
@@ -1601,7 +1619,10 @@ public actor WALManager {
         let isCompressed = payload.count != rawSize
             && payload.count >= jpegMagic.count
             && payload.prefix(jpegMagic.count).elementsEqual(jpegMagic)
-        if isCompressed, let decoded = try? decodeWALPayload(payload) {
+        if isCompressed {
+            // Same contract as the disk reader: a compressed payload that fails to
+            // decode is corrupt and is rejected rather than returned as raw.
+            let decoded = try decodeWALPayload(payload)
             return CapturedFrame(
                 timestamp: Date(timeIntervalSince1970: memoryFrame.timestamp),
                 imageData: decoded.data,
