@@ -28,7 +28,7 @@ final class WALManagerCompressedPayloadTests: XCTestCase {
     // MARK: - Compressed round-trip
 
     func testStoredFrameIsCompressedAndDecodesBackToBGRA() async throws {
-        let wal = WALManager(walRoot: walRoot)
+        let wal = WALManager(walRoot: walRoot, memoryBackedSessionsEnabled: false)
         var session = try await wal.createSession(videoID: VideoSegmentID(value: 1))
         let frame = Self.makeGradientFrame(width: 64, height: 64, seed: 30)
 
@@ -55,7 +55,7 @@ final class WALManagerCompressedPayloadTests: XCTestCase {
     // MARK: - Backward compatibility
 
     func testLegacyRawRecordStillReadsUnchanged() async throws {
-        let wal = WALManager(walRoot: walRoot)
+        let wal = WALManager(walRoot: walRoot, memoryBackedSessionsEnabled: false)
         let session = try await wal.createSession(videoID: VideoSegmentID(value: 2))
 
         // A raw record as written by the previous (uncompressed) implementation.
@@ -80,7 +80,7 @@ final class WALManagerCompressedPayloadTests: XCTestCase {
     // MARK: - Malformed records
 
     func testCorruptCompressedRecordIsRejected() async throws {
-        let wal = WALManager(walRoot: walRoot)
+        let wal = WALManager(walRoot: walRoot, memoryBackedSessionsEnabled: false)
         let session = try await wal.createSession(videoID: VideoSegmentID(value: 3))
 
         // Carries the JPEG signature and is not raw-sized, but is not a decodable image.
@@ -105,7 +105,7 @@ final class WALManagerCompressedPayloadTests: XCTestCase {
     // MARK: - Fallback
 
     func testFrameThatDoesNotShrinkIsStoredRaw() async throws {
-        let wal = WALManager(walRoot: walRoot)
+        let wal = WALManager(walRoot: walRoot, memoryBackedSessionsEnabled: false)
         var session = try await wal.createSession(videoID: VideoSegmentID(value: 4))
         // 8x8 raw is 256 bytes; a JPEG of it is larger, so the payload must stay raw.
         let frame = Self.makeGradientFrame(width: 8, height: 8, seed: 7)
