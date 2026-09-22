@@ -1218,6 +1218,15 @@ public actor WALManager {
             label: "frame header at offset \(frameOffset)"
         )
         let header = try parseFrameHeader(from: headerData)
+        let (rawSize, rawSizeOverflow) = Int(header.bytesPerRow).multipliedReportingOverflow(by: Int(header.height))
+        guard header.width > 0, header.height > 0,
+              Int(header.bytesPerRow) >= Int(header.width) * 4,
+              !rawSizeOverflow else {
+            throw StorageError.fileReadFailed(
+                path: framesURL.path,
+                underlying: "Invalid WAL frame dimensions or stride at offset \(frameOffset)"
+            )
+        }
 
         let appBundleID = try readOptionalString(
             fileHandle: fileHandle,
@@ -1259,17 +1268,23 @@ public actor WALManager {
             displayID: header.displayID
         )
 
-        // Newer WAL frames store a compressed (JPEG) payload; older ones store raw
-        // BGRA. Detect by size mismatch + magic and decode back to BGRA so every
-        // consumer (encoder recovery, OCR, timeline) still receives raw pixels.
-        // A payload carrying the compressed signature that fails to decode is a
-        // corrupt record: reject it at the WAL boundary rather than hand consumers
-        // an undersized buffer typed as raw BGRA. (A raw frame always satisfies
-        // dataSize == bytesPerRow*height, so the signature cannot match one.)
-        if Self.isCompressedWALPayload(pixelData, header: header) {
+        // Raw records must contain exactly bytesPerRow * height bytes. Any
+        // other size requires a valid compressed payload; damaged JPEG markers
+        // must not turn a short compressed buffer into a purported raw frame.
+        if pixelData.count != rawSize {
+            guard pixelData.prefix(Self.jpegMagic.count).elementsEqual(Self.jpegMagic) else {
+                throw StorageError.fileReadFailed(
+                    path: framesURL.path,
+                    underlying: "Invalid compressed WAL signature at offset \(frameOffset)"
+                )
+            }
             let decoded: (data: Data, width: Int, height: Int, bytesPerRow: Int)
             do {
-                decoded = try Self.decodeWALPayload(pixelData)
+                decoded = try Self.decodeWALPayload(
+                    pixelData,
+                    expectedWidth: Int(header.width),
+                    expectedHeight: Int(header.height)
+                )
             } catch {
                 throw StorageError.fileReadFailed(
                     path: framesURL.path,
@@ -1350,19 +1365,21 @@ public actor WALManager {
         return data
     }
 
-    /// A payload is compressed iff it is not exactly raw-sized AND starts with the
-    /// JPEG SOI marker. Future codecs (e.g. JPEG XL) can be added here by magic.
-    private static func isCompressedWALPayload(_ payload: Data, header: WALFrameHeader) -> Bool {
-        let rawSize = Int(header.bytesPerRow) * Int(header.height)
-        guard payload.count != rawSize, payload.count >= jpegMagic.count else { return false }
-        return payload.prefix(jpegMagic.count).elementsEqual(jpegMagic)
-    }
-
-    /// Decode a compressed WAL payload back to a BGRA buffer (bytesPerRow = width*4).
-    private static func decodeWALPayload(_ payload: Data) throws -> (data: Data, width: Int, height: Int, bytesPerRow: Int) {
+    /// Decode a compressed WAL payload back to BGRA, validating dimensions
+    /// before allocating a pixel buffer so recovery uses the recorded geometry.
+    private static func decodeWALPayload(
+        _ payload: Data,
+        expectedWidth: Int,
+        expectedHeight: Int
+    ) throws -> (data: Data, width: Int, height: Int, bytesPerRow: Int) {
         guard let source = CGImageSourceCreateWithData(payload as CFData, nil),
-              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-            throw StorageError.fileReadFailed(path: "", underlying: "Failed to decode compressed WAL frame payload")
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
+              width.intValue == expectedWidth, height.intValue == expectedHeight,
+              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil),
+              cgImage.width == expectedWidth, cgImage.height == expectedHeight else {
+            throw StorageError.fileReadFailed(path: "", underlying: "Invalid compressed WAL payload or mismatched dimensions")
         }
         let data = try BGRAImageUtilities.makeData(from: cgImage)
         return (data, cgImage.width, cgImage.height, cgImage.width * 4)
