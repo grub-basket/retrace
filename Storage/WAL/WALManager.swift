@@ -19,10 +19,14 @@ public enum WALQuarantineDisposition: Sendable {
 
 /// Write-Ahead Log Manager for crash-safe frame persistence
 ///
-/// Writes raw captured frames to disk before video encoding, ensuring:
-/// - No data loss on crash/termination
-/// - Fast sequential writes (raw BGRA pixels)
-/// - Recovery on app restart
+/// Holds each in-progress segment's frames (JPEG-compressed) until the segment
+/// is finalized, ensuring:
+/// - Recovery of the un-encoded tail after a crash (disk-backed sessions)
+/// - OCR access to the in-progress segment by frameID / frame index
+/// - No raw-pixel write churn: sessions are memory-backed by default and only
+///   materialize frames.bin on demand (recovery / disk-truth queries). Disk-backed
+///   sessions write compressed payloads under a header layout that still reads
+///   pre-existing raw BGRA files.
 ///
 /// Directory structure:
 /// {AppPaths.storageRoot}/wal/
@@ -56,8 +60,9 @@ public actor WALManager {
     // crash on relaunch. Sessions never change mode mid-life, which keeps frame
     // indices aligned with the on-disk offset index for disk-backed sessions.
     //
-    // Set to false to restore the disk-backed (compressed) WAL.
-    private static let memoryWALEnabled = true
+    // Memory-backed sessions are the default; pass memoryBackedSessionsEnabled:
+    // false to WALManager.init to restore the disk-backed (compressed) WAL.
+    private let memoryBackedSessionsEnabled: Bool
     /// Soft budget across all live memory-backed sessions, checked at session
     /// creation. Sessions created while over budget fall back to disk.
     private static let memoryWALBudgetBytes: Int64 = 768 * 1024 * 1024
@@ -76,8 +81,12 @@ public actor WALManager {
     private var memoryFrameIndexByFrameID: [Int64: [Int64: Int]] = [:]
     private var memoryBytesInUse: Int64 = 0
 
-    public init(walRoot: URL) {
+    /// - Parameter memoryBackedSessionsEnabled: hold each in-progress segment's
+    ///   frames in memory (no pixel writes to disk). Pass false to restore the
+    ///   disk-backed WAL, e.g. for tests that inspect frames.bin directly.
+    public init(walRoot: URL, memoryBackedSessionsEnabled: Bool = true) {
         self.walRootURL = walRoot
+        self.memoryBackedSessionsEnabled = memoryBackedSessionsEnabled
     }
 
     public func initialize() async throws {
@@ -159,11 +168,11 @@ public actor WALManager {
             )
         }
 
-        if Self.memoryWALEnabled, memoryBytesInUse < Self.memoryWALBudgetBytes {
+        if memoryBackedSessionsEnabled, memoryBytesInUse < Self.memoryWALBudgetBytes {
             memoryBackedSessions.insert(videoID.value)
             memoryFramesByVideoID[videoID.value] = [:]
             memoryFrameIndexByFrameID[videoID.value] = [:]
-        } else if Self.memoryWALEnabled {
+        } else if memoryBackedSessionsEnabled {
             Log.warning(
                 "[WAL] Memory-backed WAL budget exhausted (\(memoryBytesInUse) bytes in use); session \(videoID.value) will be disk-backed",
                 category: .storage
@@ -185,108 +194,23 @@ public actor WALManager {
             return
         }
 
-        // Open file handle for appending
-        guard let fileHandle = FileHandle(forWritingAtPath: session.framesURL.path) else {
-            throw StorageError.fileWriteFailed(
-                path: session.framesURL.path,
-                underlying: "Cannot open file for appending"
-            )
-        }
-        defer { try? fileHandle.close() }
-
-        do {
-            // Seek to end
-            if #available(macOS 10.15.4, *) {
-                try fileHandle.seekToEnd()
-            } else {
-                fileHandle.seekToEndOfFile()
-            }
-
-            // Compress the pixel payload before it touches disk. Raw BGRA at 4K is
-            // ~33MB/frame and the WAL is rewritten every segment (~5 min) then
-            // deleted, so the raw copy was pure write churn (~100GB+/day of SSD
-            // writes). JPEG at 0.9 is ~20-30x smaller and still OCR-friendly.
-            // The header layout is unchanged: readers detect a compressed payload
-            // by (dataSize != bytesPerRow*height) + the JPEG magic, so pre-existing
-            // raw frames.bin files remain readable. Falls back to raw on encode failure.
-            let payload = Self.encodeWALPayload(frame) ?? frame.imageData
-
-            // Write frame header + pixel data
-            let header = WALFrameHeader(
-                timestamp: frame.timestamp.timeIntervalSince1970,
-                width: UInt32(frame.width),
-                height: UInt32(frame.height),
-                bytesPerRow: UInt32(frame.bytesPerRow),
-                dataSize: UInt32(payload.count),
-                displayID: frame.metadata.displayID,
-                appBundleIDLength: UInt16(frame.metadata.appBundleID?.utf8.count ?? 0),
-                appNameLength: UInt16(frame.metadata.appName?.utf8.count ?? 0),
-                windowNameLength: UInt16(frame.metadata.windowName?.utf8.count ?? 0),
-                browserURLLength: UInt16(frame.metadata.browserURL?.utf8.count ?? 0)
-            )
-
-            // Write header
-            var headerData = Data()
-            withUnsafeBytes(of: header.timestamp) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.width) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.height) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.bytesPerRow) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.dataSize) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.displayID) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.appBundleIDLength) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.appNameLength) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.windowNameLength) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.browserURLLength) { headerData.append(contentsOf: $0) }
-
-            if #available(macOS 10.15.4, *) {
-                try fileHandle.write(contentsOf: headerData)
-            } else {
-                fileHandle.write(headerData)
-            }
-
-            // Write metadata strings
-            if let appBundleID = frame.metadata.appBundleID?.data(using: .utf8) {
-                if #available(macOS 10.15.4, *) {
-                    try fileHandle.write(contentsOf: appBundleID)
-                } else {
-                    fileHandle.write(appBundleID)
-                }
-            }
-            if let appName = frame.metadata.appName?.data(using: .utf8) {
-                if #available(macOS 10.15.4, *) {
-                    try fileHandle.write(contentsOf: appName)
-                } else {
-                    fileHandle.write(appName)
-                }
-            }
-            if let windowName = frame.metadata.windowName?.data(using: .utf8) {
-                if #available(macOS 10.15.4, *) {
-                    try fileHandle.write(contentsOf: windowName)
-                } else {
-                    fileHandle.write(windowName)
-                }
-            }
-            if let browserURL = frame.metadata.browserURL?.data(using: .utf8) {
-                if #available(macOS 10.15.4, *) {
-                    try fileHandle.write(contentsOf: browserURL)
-                } else {
-                    fileHandle.write(browserURL)
-                }
-            }
-
-            // Write pixel data (compressed payload, or raw on encode fallback)
-            if #available(macOS 10.15.4, *) {
-                try fileHandle.write(contentsOf: payload)
-            } else {
-                fileHandle.write(payload)
-            }
-        } catch {
-            throw makeStorageWriteError(
-                path: session.framesURL.path,
-                error: error,
-                fallback: "Failed to append frame to WAL"
-            )
-        }
+        // Compress the pixel payload before it touches disk. Raw BGRA at 4K is
+        // ~33MB/frame and the WAL is rewritten every segment (~5 min) then
+        // deleted, so the raw copy was pure write churn (~100GB+/day of SSD
+        // writes). JPEG at 0.9 is ~20-30x smaller and still OCR-friendly.
+        // The header layout is unchanged: readers detect a compressed payload
+        // by (dataSize != bytesPerRow*height) + the JPEG magic, so pre-existing
+        // raw frames.bin files remain readable. Falls back to raw on encode failure.
+        let payload = Self.encodeWALPayload(frame) ?? frame.imageData
+        try writeFrameRecordToDisk(
+            framesURL: session.framesURL,
+            timestamp: frame.timestamp.timeIntervalSince1970,
+            width: frame.width,
+            height: frame.height,
+            bytesPerRow: frame.bytesPerRow,
+            payload: payload,
+            metadata: frame.metadata
+        )
 
         // Update session metadata
         session.metadata.frameCount += 1
@@ -472,6 +396,10 @@ public actor WALManager {
 
         frameOffsetIndexCache.removeAll()
         frameIDOffsetIndexCache.removeAll()
+        memoryBackedSessions.removeAll()
+        memoryFramesByVideoID.removeAll()
+        memoryFrameIndexByFrameID.removeAll()
+        memoryBytesInUse = 0
     }
 
     /// Delete discardable quarantined WAL sessions older than the provided cutoff date.
@@ -647,12 +575,10 @@ public actor WALManager {
     /// Returns recoverable frame count for an active WAL directory if present.
     /// - Returns: `nil` when no active WAL directory exists for `videoID`.
     public func recoverableFrameCountIfPresent(videoID: VideoSegmentID) async throws -> Int? {
-        if memoryBackedSessions.contains(videoID.value) {
-            // Live memory-backed session: report the in-memory count so callers that
-            // refuse to delete a session holding frames (finalizeSessionDirectoryIfPresent,
-            // stale-WAL cleanup) keep protecting it even though frames.bin is empty on disk.
-            return memoryFramesByVideoID[videoID.value]?.count ?? 0
-        }
+        // A "recoverable frame count" is a disk-truth query (used to decide whether a
+        // session dir may be deleted or must be preserved for recovery); materialize
+        // a live memory-backed session so the answer matches a disk-backed one.
+        try await spillMemorySessionToDiskIfNeeded(videoID: videoID)
 
         let sessionDir = walRootURL.appendingPathComponent("active_segment_\(videoID.value)")
         guard FileManager.default.fileExists(atPath: sessionDir.path) else {
@@ -674,6 +600,9 @@ public actor WALManager {
     }
 
     func recoveryIndex(for session: WALSession) async throws -> WALRecoveryIndex {
+        // Recovery needs disk truth (byte offsets); materialize a live memory-backed
+        // session first. Sessions from a previous process are never memory-backed.
+        try await spillMemorySessionToDiskIfNeeded(videoID: session.videoID)
         let fileSize = try await framesFileSize(for: session)
         guard fileSize > 0 else {
             return WALRecoveryIndex(recoverableOffsets: [], mappedFrames: [])
@@ -795,10 +724,8 @@ public actor WALManager {
 
     /// Read all frames from a WAL session
     public func readFrames(from session: WALSession) async throws -> [CapturedFrame] {
-        if memoryBackedSessions.contains(session.videoID.value) {
-            let frames = memoryFramesByVideoID[session.videoID.value] ?? [:]
-            return try frames.keys.sorted().map { try Self.makeCapturedFrame(fromMemory: frames[$0]!) }
-        }
+        // Eager whole-session reads are a recovery-style disk-truth path.
+        try await spillMemorySessionToDiskIfNeeded(videoID: session.videoID)
 
         let fileSize = try await framesFileSize(for: session)
         if fileSize > Self.eagerReadSafetyLimitBytes {
@@ -1501,6 +1428,127 @@ public actor WALManager {
             memoryBytesInUse = max(0, memoryBytesInUse - released)
         }
         memoryFrameIndexByFrameID.removeValue(forKey: videoIDValue)
+    }
+
+    /// Materialize a live memory-backed session onto disk so every offset-based
+    /// path (recovery index, frameID map, offset reads) sees exactly what a
+    /// disk-backed session would. The session becomes disk-backed for the rest
+    /// of its life. No-op for disk-backed sessions, and never hit in the happy
+    /// path (append -> encode -> finalize); only when disk truth is requested.
+    private func spillMemorySessionToDiskIfNeeded(videoID: VideoSegmentID) async throws {
+        let id = videoID.value
+        guard memoryBackedSessions.contains(id) else { return }
+
+        let frames = memoryFramesByVideoID[id] ?? [:]
+        let frameIDs = memoryFrameIndexByFrameID[id] ?? [:]
+        let framesURL = walRootURL
+            .appendingPathComponent("active_segment_\(id)")
+            .appendingPathComponent("frames.bin")
+
+        // Convert to disk mode first so the disk append/register paths are used
+        // from here on and no further frames land in memory for this session.
+        dropMemorySession(id)
+
+        for index in frames.keys.sorted() {
+            let memoryFrame = frames[index]!
+            try writeFrameRecordToDisk(
+                framesURL: framesURL,
+                timestamp: memoryFrame.timestamp,
+                width: memoryFrame.width,
+                height: memoryFrame.height,
+                bytesPerRow: memoryFrame.bytesPerRow,
+                payload: memoryFrame.payload,
+                metadata: memoryFrame.metadata
+            )
+        }
+        frameOffsetIndexCache.removeValue(forKey: id)
+
+        // Replay the frameID map now that byte offsets exist on disk.
+        for (frameID, frameIndex) in frameIDs.sorted(by: { $0.value < $1.value }) {
+            try await registerFrameID(videoID: videoID, frameID: frameID, frameIndex: frameIndex)
+        }
+
+        Log.info(
+            "[WAL] Spilled memory-backed session \(id) to disk (\(frames.count) frames)",
+            category: .storage
+        )
+    }
+
+    /// Write one frame record (header + metadata strings + payload) to frames.bin.
+    /// Shared by the disk append path and by spilling a memory-backed session.
+    private func writeFrameRecordToDisk(
+        framesURL: URL,
+        timestamp: Double,
+        width: Int,
+        height: Int,
+        bytesPerRow: Int,
+        payload: Data,
+        metadata: FrameMetadata
+    ) throws {
+        guard let fileHandle = FileHandle(forWritingAtPath: framesURL.path) else {
+            throw StorageError.fileWriteFailed(
+                path: framesURL.path,
+                underlying: "Cannot open file for appending"
+            )
+        }
+        defer { try? fileHandle.close() }
+
+        do {
+            if #available(macOS 10.15.4, *) {
+                try fileHandle.seekToEnd()
+            } else {
+                fileHandle.seekToEndOfFile()
+            }
+
+            let header = WALFrameHeader(
+                timestamp: timestamp,
+                width: UInt32(width),
+                height: UInt32(height),
+                bytesPerRow: UInt32(bytesPerRow),
+                dataSize: UInt32(payload.count),
+                displayID: metadata.displayID,
+                appBundleIDLength: UInt16(metadata.appBundleID?.utf8.count ?? 0),
+                appNameLength: UInt16(metadata.appName?.utf8.count ?? 0),
+                windowNameLength: UInt16(metadata.windowName?.utf8.count ?? 0),
+                browserURLLength: UInt16(metadata.browserURL?.utf8.count ?? 0)
+            )
+
+            var headerData = Data()
+            withUnsafeBytes(of: header.timestamp) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.width) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.height) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.bytesPerRow) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.dataSize) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.displayID) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.appBundleIDLength) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.appNameLength) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.windowNameLength) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.browserURLLength) { headerData.append(contentsOf: $0) }
+            try writeToHandle(fileHandle, headerData)
+
+            // Metadata strings, in the same order as their header lengths.
+            for string in [metadata.appBundleID, metadata.appName, metadata.windowName, metadata.browserURL] {
+                if let data = string?.data(using: .utf8) {
+                    try writeToHandle(fileHandle, data)
+                }
+            }
+
+            try writeToHandle(fileHandle, payload)
+        } catch {
+            throw makeStorageWriteError(
+                path: framesURL.path,
+                error: error,
+                fallback: "Failed to append frame to WAL"
+            )
+        }
+    }
+
+    private func writeToHandle(_ fileHandle: FileHandle, _ data: Data) throws {
+        if #available(macOS 10.15.4, *) {
+            try fileHandle.write(contentsOf: data)
+        } else {
+            fileHandle.write(data)
+        }
     }
 
     /// Rebuild a CapturedFrame (raw BGRA) from an in-memory WAL frame, decoding
