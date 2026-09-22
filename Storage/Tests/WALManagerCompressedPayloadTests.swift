@@ -102,6 +102,58 @@ final class WALManagerCompressedPayloadTests: XCTestCase {
         }
     }
 
+    func testDamagedJPEGMarkerIsRejectedInsteadOfReturnedAsRaw() async throws {
+        let wal = WALManager(walRoot: walRoot)
+        var session = try await wal.createSession(videoID: VideoSegmentID(value: 5))
+        let frame = Self.makeGradientFrame(width: 64, height: 64, seed: 30)
+        try await wal.appendFrame(frame, to: &session)
+        var record = try Data(contentsOf: session.framesURL)
+        let metadataSize = [frame.metadata.appBundleID, frame.metadata.appName,
+                            frame.metadata.windowName, frame.metadata.browserURL]
+            .reduce(0) { $0 + ($1?.utf8.count ?? 0) }
+        let payloadOffset = 36 + metadataSize
+        XCTAssertEqual(Array(record[payloadOffset..<(payloadOffset + 3)]), [0xFF, 0xD8, 0xFF])
+        record[payloadOffset] = 0 // Damage a real compressed record's signature.
+        try record.write(to: session.framesURL)
+        try await assertReadRejected(wal, videoID: session.videoID)
+    }
+
+    func testOverflowingRawSizeIsRejectedWithoutTrapping() async throws {
+        let wal = WALManager(walRoot: walRoot)
+        let session = try await wal.createSession(videoID: VideoSegmentID(value: 6))
+        try Self.writeRecord(
+            to: session.framesURL,
+            payload: Data([0xFF, 0xD8, 0xFF, 0]),
+            width: 64,
+            height: Int(UInt32.max),
+            bytesPerRow: Int(UInt32.max)
+        )
+        try await assertReadRejected(wal, videoID: session.videoID)
+    }
+
+    func testCompressedDimensionsMustMatchWALHeader() async throws {
+        let wal = WALManager(walRoot: walRoot)
+        var session = try await wal.createSession(videoID: VideoSegmentID(value: 7))
+        try await wal.appendFrame(Self.makeGradientFrame(width: 64, height: 64, seed: 30), to: &session)
+        var record = try Data(contentsOf: session.framesURL)
+        let width = UInt32(32)
+        withUnsafeBytes(of: width) { record.replaceSubrange(8..<12, with: $0) }
+        try record.write(to: session.framesURL)
+        try await assertReadRejected(wal, videoID: session.videoID)
+    }
+
+    private func assertReadRejected(_ wal: WALManager, videoID: VideoSegmentID) async throws {
+        do {
+            _ = try await wal.readFrame(videoID: videoID, frameIndex: 0)
+            XCTFail("Corrupt WAL records must be rejected before returning raw pixels")
+        } catch let error as StorageError {
+            guard case .fileReadFailed = error else {
+                XCTFail("Expected fileReadFailed, got \(error)")
+                return
+            }
+        }
+    }
+
     // MARK: - Fallback
 
     func testFrameThatDoesNotShrinkIsStoredRaw() async throws {
