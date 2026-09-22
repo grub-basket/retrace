@@ -1262,9 +1262,20 @@ public actor WALManager {
         // Newer WAL frames store a compressed (JPEG) payload; older ones store raw
         // BGRA. Detect by size mismatch + magic and decode back to BGRA so every
         // consumer (encoder recovery, OCR, timeline) still receives raw pixels.
-        // A detection false-positive that fails to decode falls back to raw.
-        if Self.isCompressedWALPayload(pixelData, header: header),
-           let decoded = try? Self.decodeWALPayload(pixelData) {
+        // A payload carrying the compressed signature that fails to decode is a
+        // corrupt record: reject it at the WAL boundary rather than hand consumers
+        // an undersized buffer typed as raw BGRA. (A raw frame always satisfies
+        // dataSize == bytesPerRow*height, so the signature cannot match one.)
+        if Self.isCompressedWALPayload(pixelData, header: header) {
+            let decoded: (data: Data, width: Int, height: Int, bytesPerRow: Int)
+            do {
+                decoded = try Self.decodeWALPayload(pixelData)
+            } catch {
+                throw StorageError.fileReadFailed(
+                    path: framesURL.path,
+                    underlying: "Corrupt compressed WAL frame at offset \(frameOffset): \(error.localizedDescription)"
+                )
+            }
             return CapturedFrame(
                 timestamp: Date(timeIntervalSince1970: header.timestamp),
                 imageData: decoded.data,
