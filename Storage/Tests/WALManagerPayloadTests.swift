@@ -48,7 +48,7 @@ final class WALManagerPayloadTests: XCTestCase {
         XCTAssertEqual(read.imageData.count, 64 * 4 * 64)
         XCTAssertEqual(read.metadata.appBundleID, frame.metadata.appBundleID)
         XCTAssertEqual(read.metadata.windowName, frame.metadata.windowName)
-        XCTAssertEqual(read.imageData, frame.imageData, \"lossless: pixels must match exactly\")
+        XCTAssertEqual(read.imageData, frame.imageData, "lossless: pixels must match exactly")
     }
 
     // MARK: - Backward compatibility: legacy raw records
@@ -96,9 +96,9 @@ final class WALManagerPayloadTests: XCTestCase {
         )
 
         let byID = try await wal.readFrame(videoID: session.videoID, frameID: 101, fallbackFrameIndex: 1)
-        XCTAssertEqual(byID.imageData, frames[1].imageData, \"lossless: pixels must match exactly\")
+        XCTAssertEqual(byID.imageData, frames[1].imageData, "lossless: pixels must match exactly")
         let byIndex = try await wal.readFrame(videoID: session.videoID, frameIndex: 2)
-        XCTAssertEqual(byIndex.imageData, frames[2].imageData, \"lossless: pixels must match exactly\")
+        XCTAssertEqual(byIndex.imageData, frames[2].imageData, "lossless: pixels must match exactly")
 
         // A disk-truth query spills the session: recovery must see every frame.
         let recoverable = try await wal.recoverableFrameCountIfPresent(videoID: session.videoID)
@@ -107,7 +107,7 @@ final class WALManagerPayloadTests: XCTestCase {
 
         // After the spill, frameID lookups keep working via the replayed on-disk map.
         let afterSpill = try await wal.readFrame(videoID: session.videoID, frameID: 100, fallbackFrameIndex: 0)
-        XCTAssertEqual(afterSpill.imageData, frames[0].imageData, \"lossless: pixels must match exactly\")
+        XCTAssertEqual(afterSpill.imageData, frames[0].imageData, "lossless: pixels must match exactly")
 
         try await wal.finalizeSession(session)
         XCTAssertFalse(FileManager.default.fileExists(atPath: session.sessionDir.path))
@@ -155,7 +155,7 @@ final class WALManagerPayloadTests: XCTestCase {
             // The complete memory copy must still serve reads and accept appends.
         }
         let retained = try await wal.readFrame(videoID: session.videoID, frameID: 101, fallbackFrameIndex: 999)
-        XCTAssertEqual(retained.imageData, first.imageData, \"lossless: pixels must match exactly\")
+        XCTAssertEqual(retained.imageData, first.imageData, "lossless: pixels must match exactly")
         try await wal.appendFrame(second, to: &session)
         try await wal.registerFrameID(videoID: session.videoID, frameID: 102, frameIndex: 1)
 
@@ -168,8 +168,8 @@ final class WALManagerPayloadTests: XCTestCase {
         let reopened = WALManager(walRoot: walRoot)
         let readFirst = try await reopened.readFrame(videoID: session.videoID, frameID: 101, fallbackFrameIndex: 999)
         let readSecond = try await reopened.readFrame(videoID: session.videoID, frameID: 102, fallbackFrameIndex: 999)
-        XCTAssertEqual(readFirst.imageData, first.imageData, \"lossless: pixels must match exactly\")
-        XCTAssertEqual(readSecond.imageData, second.imageData, \"lossless: pixels must match exactly\")
+        XCTAssertEqual(readFirst.imageData, first.imageData, "lossless: pixels must match exactly")
+        XCTAssertEqual(readSecond.imageData, second.imageData, "lossless: pixels must match exactly")
     }
 
     // MARK: - Budget is a hard bound
