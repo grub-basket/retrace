@@ -1,7 +1,5 @@
-import CoreGraphics
 import Darwin
 import Foundation
-import ImageIO
 import Shared
 
 public enum WALQuarantineDisposition: Sendable {
@@ -20,7 +18,7 @@ public enum WALQuarantineDisposition: Sendable {
 
 /// Write-Ahead Log Manager for crash-safe frame persistence
 ///
-/// Holds each in-progress segment's frames (JPEG-compressed) until the segment
+/// Holds each in-progress segment's frames (LZ4-compressed, lossless) until the segment
 /// is finalized, ensuring:
 /// - Recovery of the un-encoded tail after a crash (disk-backed sessions)
 /// - OCR access to the in-progress segment by frameID / frame index
@@ -48,9 +46,11 @@ public actor WALManager {
     // The WAL protects frames until they are durable in the fragmented MP4
     // (fragments flush every 0.1s of video time, i.e. every ~3 frames) and lets
     // OCR read the in-progress segment. Writing every frame to disk for that
-    // was ~100GB+/day of write churn at 4K. With compressed payloads a whole
-    // 150-frame segment is ~150-250MB, so the in-progress segment is held in
-    // memory instead and NOTHING pixel-sized touches disk in the happy path.
+    // was ~100GB+/day of write churn at 4K. With lossless LZ4 payloads (~5-7x
+    // smaller; the WAL is the OCR input, so it must stay pixel-exact) a whole
+    // 150-frame segment is roughly 400-900MB depending on resolution, so the
+    // in-progress segment is held in memory and NOTHING pixel-sized touches disk
+    // in the happy path; the budget below spills a session to disk if exceeded.
     //
     // Crash semantics: on crash the in-memory frames are lost, so the session
     // directory is found with frameCount>0 but an empty frames.bin. Recovery
@@ -71,7 +71,7 @@ public actor WALManager {
     private let memoryBudgetBytes: Int64
 
     private struct WALMemoryFrame {
-        let payload: Data          // compressed (JPEG), or raw BGRA on encode fallback
+        let payload: Data          // compressed (LZ4), or raw BGRA on encode fallback
         let timestamp: Double
         let width: Int
         let height: Int
@@ -93,7 +93,7 @@ public actor WALManager {
     public init(
         walRoot: URL,
         memoryBackedSessionsEnabled: Bool = true,
-        memoryBudgetBytes: Int64 = 768 * 1024 * 1024
+        memoryBudgetBytes: Int64 = 1024 * 1024 * 1024
     ) {
         self.walRootURL = walRoot
         self.memoryBackedSessionsEnabled = memoryBackedSessionsEnabled
@@ -203,9 +203,10 @@ public actor WALManager {
         // Compress the pixel payload once, for either destination. Raw BGRA at 4K
         // is ~33MB/frame and the WAL is rewritten every segment (~5 min) then
         // deleted, so the raw copy was pure write churn (~100GB+/day of SSD
-        // writes). JPEG at 0.9 is ~20-30x smaller and still OCR-friendly.
+        // writes). LZ4 is lossless (OCR reads unfinalized frames from here, so
+        // the WAL codec is the OCR input codec) at ~6-7x smaller.
         // The header layout is unchanged: readers detect a compressed payload
-        // by (dataSize != bytesPerRow*height) + the JPEG magic, so pre-existing
+        // by (dataSize != bytesPerRow*height) + the RWZ4 magic, so pre-existing
         // raw frames.bin files remain readable. Falls back to raw on encode failure.
         let payload = Self.encodeWALPayload(frame) ?? frame.imageData
 
@@ -1326,34 +1327,31 @@ public actor WALManager {
         )
 
         // Raw records must contain exactly bytesPerRow * height bytes. Any
-        // other size requires a valid compressed payload; damaged JPEG markers
+        // other size requires a valid compressed payload: a damaged signature
         // must not turn a short compressed buffer into a purported raw frame.
         if pixelData.count != rawSize {
-            guard pixelData.prefix(Self.jpegMagic.count).elementsEqual(Self.jpegMagic) else {
+            guard pixelData.prefix(Self.walLZ4Magic.count).elementsEqual(Self.walLZ4Magic) else {
                 throw StorageError.fileReadFailed(
                     path: framesURL.path,
                     underlying: "Invalid compressed WAL signature at offset \(frameOffset)"
                 )
             }
-            let decoded: (data: Data, width: Int, height: Int, bytesPerRow: Int)
+            let decoded: Data
             do {
-                decoded = try Self.decodeWALPayload(
-                    pixelData,
-                    expectedWidth: Int(header.width),
-                    expectedHeight: Int(header.height)
-                )
+                decoded = try Self.decodeWALPayload(pixelData, expectedRawSize: rawSize)
             } catch {
                 throw StorageError.fileReadFailed(
                     path: framesURL.path,
                     underlying: "Corrupt compressed WAL frame at offset \(frameOffset): \(error.localizedDescription)"
                 )
             }
+            // Lossless: the decoded buffer is the original frame, stride included.
             return CapturedFrame(
                 timestamp: Date(timeIntervalSince1970: header.timestamp),
-                imageData: decoded.data,
-                width: decoded.width,
-                height: decoded.height,
-                bytesPerRow: decoded.bytesPerRow,
+                imageData: decoded,
+                width: Int(header.width),
+                height: Int(header.height),
+                bytesPerRow: Int(header.bytesPerRow),
                 metadata: metadata
             )
         }
@@ -1370,76 +1368,40 @@ public actor WALManager {
 
     // MARK: - WAL payload compression
 
-    /// JPEG quality for WAL frame payloads. Higher than the timeline still cache
-    /// (0.8) because these frames feed OCR and crash-recovery re-encoding.
-    private static let walJPEGCompressionQuality: CGFloat = 0.9
-    private static let jpegMagic: [UInt8] = [0xFF, 0xD8, 0xFF]
+    /// Prefix on compressed payloads. A raw record always satisfies
+    /// dataSize == bytesPerRow*height and encode refuses to emit that size, so
+    /// the two can never be confused. Lossless (LZ4) on purpose: OCR reads
+    /// unfinalized frames from the WAL, so the WAL codec is the OCR input codec
+    /// (JPEG, even at q=1.0, changed ~19-26% of OCR tokens per frame on real
+    /// captures; LZ4 is pixel-exact at ~6-7x smaller, ~12ms per append).
+    private static let walLZ4Magic: [UInt8] = Array("RWZ4".utf8)
 
-    /// Build a CGImage view over a captured frame's BGRA buffer (premultipliedFirst,
-    /// little-endian 32-bit -- the same layout BGRAImageUtilities.makeData produces).
-    private static func makeCGImage(fromBGRA frame: CapturedFrame) -> CGImage? {
-        guard frame.width > 0, frame.height > 0, frame.bytesPerRow > 0 else { return nil }
-        let bitmapInfo = CGBitmapInfo(
-            rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-        )
-        guard let provider = CGDataProvider(data: frame.imageData as CFData) else { return nil }
-        return CGImage(
-            width: frame.width,
-            height: frame.height,
-            bitsPerComponent: 8,
-            bitsPerPixel: 32,
-            bytesPerRow: frame.bytesPerRow,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: bitmapInfo,
-            provider: provider,
-            decode: nil,
-            shouldInterpolate: false,
-            intent: .defaultIntent
-        )
-    }
-
-    /// JPEG-encode a frame for WAL storage. Returns nil (caller writes raw) if
-    /// encoding fails or would not actually shrink the payload, and guarantees the
-    /// result can never be mistaken for a raw payload of the same dimensions.
+    /// LZ4-compress a frame's BGRA buffer for WAL storage. Returns nil (caller
+    /// writes raw) if compression fails or would not shrink the payload, and
+    /// guarantees the result can never be mistaken for a raw payload.
     private static func encodeWALPayload(_ frame: CapturedFrame) -> Data? {
-        guard let cgImage = makeCGImage(fromBGRA: frame) else { return nil }
-        let output = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(
-            output as CFMutableData,
-            "public.jpeg" as CFString,
-            1,
-            nil
-        ) else { return nil }
-        CGImageDestinationAddImage(
-            destination,
-            cgImage,
-            [kCGImageDestinationLossyCompressionQuality: walJPEGCompressionQuality] as CFDictionary
-        )
-        guard CGImageDestinationFinalize(destination) else { return nil }
-        let data = output as Data
+        guard let compressed = try? (frame.imageData as NSData).compressed(using: .lz4) as Data else {
+            return nil
+        }
+        var data = Data(walLZ4Magic)
+        data.append(compressed)
         let rawSize = frame.bytesPerRow * frame.height
         guard data.count < frame.imageData.count, data.count != rawSize else { return nil }
         return data
     }
 
-    /// Decode a compressed WAL payload back to BGRA, validating dimensions
-    /// before allocating a pixel buffer so recovery uses the recorded geometry.
-    private static func decodeWALPayload(
-        _ payload: Data,
-        expectedWidth: Int,
-        expectedHeight: Int
-    ) throws -> (data: Data, width: Int, height: Int, bytesPerRow: Int) {
-        guard let source = CGImageSourceCreateWithData(payload as CFData, nil),
-              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
-              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
-              width.intValue == expectedWidth, height.intValue == expectedHeight,
-              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil),
-              cgImage.width == expectedWidth, cgImage.height == expectedHeight else {
-            throw StorageError.fileReadFailed(path: "", underlying: "Invalid compressed WAL payload or mismatched dimensions")
+    /// Decompress a WAL payload back to the exact original BGRA buffer (same
+    /// stride). Throws unless the body decompresses to precisely rawSize bytes.
+    private static func decodeWALPayload(_ payload: Data, expectedRawSize rawSize: Int) throws -> Data {
+        let body = Data(payload.dropFirst(walLZ4Magic.count))
+        let decoded = try (body as NSData).decompressed(using: .lz4) as Data
+        guard decoded.count == rawSize else {
+            throw StorageError.fileReadFailed(
+                path: "",
+                underlying: "Decompressed WAL payload is \(decoded.count) bytes, expected \(rawSize)"
+            )
         }
-        let data = try BGRAImageUtilities.makeData(from: cgImage)
-        return (data, cgImage.width, cgImage.height, cgImage.width * 4)
+        return decoded
     }
 
     // MARK: - Memory-backed WAL helpers
@@ -1637,23 +1599,20 @@ public actor WALManager {
             // Same contract as the disk reader: a non-raw-sized payload must carry
             // the compressed signature and decode to the recorded dimensions;
             // anything else is corrupt and is rejected rather than returned as raw.
-            guard payload.prefix(jpegMagic.count).elementsEqual(jpegMagic) else {
+            guard payload.prefix(walLZ4Magic.count).elementsEqual(walLZ4Magic) else {
                 throw StorageError.fileReadFailed(
                     path: "WAL(memory)",
                     underlying: "Invalid compressed WAL signature in memory-backed frame"
                 )
             }
-            let decoded = try decodeWALPayload(
-                payload,
-                expectedWidth: memoryFrame.width,
-                expectedHeight: memoryFrame.height
-            )
+            let decoded = try decodeWALPayload(payload, expectedRawSize: rawSize)
+            // Lossless: the decoded buffer is the original frame, stride included.
             return CapturedFrame(
                 timestamp: Date(timeIntervalSince1970: memoryFrame.timestamp),
-                imageData: decoded.data,
-                width: decoded.width,
-                height: decoded.height,
-                bytesPerRow: decoded.bytesPerRow,
+                imageData: decoded,
+                width: memoryFrame.width,
+                height: memoryFrame.height,
+                bytesPerRow: memoryFrame.bytesPerRow,
                 metadata: memoryFrame.metadata
             )
         }

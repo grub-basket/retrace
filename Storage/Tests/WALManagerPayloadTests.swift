@@ -48,7 +48,7 @@ final class WALManagerPayloadTests: XCTestCase {
         XCTAssertEqual(read.imageData.count, 64 * 4 * 64)
         XCTAssertEqual(read.metadata.appBundleID, frame.metadata.appBundleID)
         XCTAssertEqual(read.metadata.windowName, frame.metadata.windowName)
-        Self.assertPixelsApproximatelyEqual(read, frame, tolerance: 16)
+        XCTAssertEqual(read.imageData, frame.imageData, \"lossless: pixels must match exactly\")
     }
 
     // MARK: - Backward compatibility: legacy raw records
@@ -96,9 +96,9 @@ final class WALManagerPayloadTests: XCTestCase {
         )
 
         let byID = try await wal.readFrame(videoID: session.videoID, frameID: 101, fallbackFrameIndex: 1)
-        Self.assertPixelsApproximatelyEqual(byID, frames[1], tolerance: 16)
+        XCTAssertEqual(byID.imageData, frames[1].imageData, \"lossless: pixels must match exactly\")
         let byIndex = try await wal.readFrame(videoID: session.videoID, frameIndex: 2)
-        Self.assertPixelsApproximatelyEqual(byIndex, frames[2], tolerance: 16)
+        XCTAssertEqual(byIndex.imageData, frames[2].imageData, \"lossless: pixels must match exactly\")
 
         // A disk-truth query spills the session: recovery must see every frame.
         let recoverable = try await wal.recoverableFrameCountIfPresent(videoID: session.videoID)
@@ -107,7 +107,7 @@ final class WALManagerPayloadTests: XCTestCase {
 
         // After the spill, frameID lookups keep working via the replayed on-disk map.
         let afterSpill = try await wal.readFrame(videoID: session.videoID, frameID: 100, fallbackFrameIndex: 0)
-        Self.assertPixelsApproximatelyEqual(afterSpill, frames[0], tolerance: 16)
+        XCTAssertEqual(afterSpill.imageData, frames[0].imageData, \"lossless: pixels must match exactly\")
 
         try await wal.finalizeSession(session)
         XCTAssertFalse(FileManager.default.fileExists(atPath: session.sessionDir.path))
@@ -155,7 +155,7 @@ final class WALManagerPayloadTests: XCTestCase {
             // The complete memory copy must still serve reads and accept appends.
         }
         let retained = try await wal.readFrame(videoID: session.videoID, frameID: 101, fallbackFrameIndex: 999)
-        Self.assertPixelsApproximatelyEqual(retained, first, tolerance: 16)
+        XCTAssertEqual(retained.imageData, first.imageData, \"lossless: pixels must match exactly\")
         try await wal.appendFrame(second, to: &session)
         try await wal.registerFrameID(videoID: session.videoID, frameID: 102, frameIndex: 1)
 
@@ -168,8 +168,8 @@ final class WALManagerPayloadTests: XCTestCase {
         let reopened = WALManager(walRoot: walRoot)
         let readFirst = try await reopened.readFrame(videoID: session.videoID, frameID: 101, fallbackFrameIndex: 999)
         let readSecond = try await reopened.readFrame(videoID: session.videoID, frameID: 102, fallbackFrameIndex: 999)
-        Self.assertPixelsApproximatelyEqual(readFirst, first, tolerance: 16)
-        Self.assertPixelsApproximatelyEqual(readSecond, second, tolerance: 16)
+        XCTAssertEqual(readFirst.imageData, first.imageData, \"lossless: pixels must match exactly\")
+        XCTAssertEqual(readSecond.imageData, second.imageData, \"lossless: pixels must match exactly\")
     }
 
     // MARK: - Budget is a hard bound
@@ -266,36 +266,6 @@ final class WALManagerPayloadTests: XCTestCase {
                 browserURL: nil,
                 displayID: 1
             )
-        )
-    }
-
-    /// Compare B/G/R of every pixel within a tolerance (alpha ignored: JPEG has none).
-    private static func assertPixelsApproximatelyEqual(
-        _ actual: CapturedFrame,
-        _ expected: CapturedFrame,
-        tolerance: Int,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) {
-        XCTAssertEqual(actual.width, expected.width, file: file, line: line)
-        XCTAssertEqual(actual.height, expected.height, file: file, line: line)
-        var maxDelta = 0
-        for y in 0..<expected.height {
-            for x in 0..<expected.width {
-                let a = y * actual.bytesPerRow + x * 4
-                let e = y * expected.bytesPerRow + x * 4
-                for channel in 0..<3 {
-                    let delta = abs(Int(actual.imageData[a + channel]) - Int(expected.imageData[e + channel]))
-                    maxDelta = max(maxDelta, delta)
-                }
-            }
-        }
-        XCTAssertLessThanOrEqual(
-            maxDelta,
-            tolerance,
-            "decoded pixels drifted by up to \(maxDelta) (> \(tolerance))",
-            file: file,
-            line: line
         )
     }
 
