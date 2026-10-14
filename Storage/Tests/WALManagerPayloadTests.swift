@@ -29,7 +29,7 @@ final class WALManagerPayloadTests: XCTestCase {
     func testDiskBackedSessionStoresCompressedPayloadAndDecodesBackToBGRA() async throws {
         let wal = WALManager(walRoot: walRoot, memoryBackedSessionsEnabled: false)
         var session = try await wal.createSession(videoID: VideoSegmentID(value: 1))
-        let frame = Self.makeGradientFrame(width: 64, height: 64, seed: 30)
+        let frame = Self.makeScreenLikeFrame(width: 64, height: 64, seed: 30)
 
         try await wal.appendFrame(frame, to: &session)
 
@@ -81,7 +81,7 @@ final class WALManagerPayloadTests: XCTestCase {
     func testMemoryBackedSessionWritesNoPixelDataAndServesReads() async throws {
         let wal = WALManager(walRoot: walRoot) // memory-backed by default
         var session = try await wal.createSession(videoID: VideoSegmentID(value: 3))
-        let frames = (0..<3).map { Self.makeGradientFrame(width: 64, height: 64, seed: UInt8($0 * 60)) }
+        let frames = (0..<3).map { Self.makeScreenLikeFrame(width: 64, height: 64, seed: UInt8($0 * 60)) }
 
         for (index, frame) in frames.enumerated() {
             try await wal.appendFrame(frame, to: &session)
@@ -116,7 +116,7 @@ final class WALManagerPayloadTests: XCTestCase {
     func testMemoryBackedReadByUnregisteredFrameIDRefusesIndexFallback() async throws {
         let wal = WALManager(walRoot: walRoot)
         var session = try await wal.createSession(videoID: VideoSegmentID(value: 4))
-        try await wal.appendFrame(Self.makeGradientFrame(width: 64, height: 64, seed: 0), to: &session)
+        try await wal.appendFrame(Self.makeScreenLikeFrame(width: 64, height: 64, seed: 0), to: &session)
 
         do {
             _ = try await wal.readFrame(videoID: session.videoID, frameID: 999, fallbackFrameIndex: 0)
@@ -137,8 +137,8 @@ final class WALManagerPayloadTests: XCTestCase {
     private func assertFailedSpillCanRetry(blockedName: String) async throws {
         let wal = WALManager(walRoot: walRoot)
         var session = try await wal.createSession(videoID: VideoSegmentID(value: 5))
-        let first = Self.makeGradientFrame(width: 64, height: 64, seed: 20)
-        let second = Self.makeGradientFrame(width: 64, height: 64, seed: 80)
+        let first = Self.makeScreenLikeFrame(width: 64, height: 64, seed: 20)
+        let second = Self.makeScreenLikeFrame(width: 64, height: 64, seed: 80)
         try await wal.appendFrame(first, to: &session)
         try await wal.registerFrameID(videoID: session.videoID, frameID: 101, frameIndex: 0)
 
@@ -175,11 +175,11 @@ final class WALManagerPayloadTests: XCTestCase {
     // MARK: - Budget is a hard bound
 
     func testAppendBeyondBudgetSpillsSessionToDiskAndContinuesThere() async throws {
-        // 8x8 frames are stored raw (a JPEG would be larger), so each payload is
+        // 8x8 random frames cannot be compressed, so each payload is stored raw at
         // exactly 256 bytes and the arithmetic below is deterministic.
         let wal = WALManager(walRoot: walRoot, memoryBudgetBytes: 600)
         var session = try await wal.createSession(videoID: VideoSegmentID(value: 6))
-        let frames = (0..<4).map { Self.makeGradientFrame(width: 8, height: 8, seed: UInt8($0 * 50)) }
+        let frames = (0..<4).map { _ in Self.makeIncompressibleFrame(width: 8, height: 8) }
 
         try await wal.appendFrame(frames[0], to: &session) // 256 in memory
         try await wal.appendFrame(frames[1], to: &session) // 512 in memory
@@ -207,8 +207,8 @@ final class WALManagerPayloadTests: XCTestCase {
     func testRelaunchSeesUnspilledMemoryBackedSessionAsEmptyFramesBin() async throws {
         let wal = WALManager(walRoot: walRoot)
         var session = try await wal.createSession(videoID: VideoSegmentID(value: 7))
-        try await wal.appendFrame(Self.makeGradientFrame(width: 64, height: 64, seed: 10), to: &session)
-        try await wal.appendFrame(Self.makeGradientFrame(width: 64, height: 64, seed: 20), to: &session)
+        try await wal.appendFrame(Self.makeScreenLikeFrame(width: 64, height: 64, seed: 10), to: &session)
+        try await wal.appendFrame(Self.makeScreenLikeFrame(width: 64, height: 64, seed: 20), to: &session)
 
         // A new manager over the same root simulates a relaunch: the previous
         // process's memory is gone; only the sidecars and an empty frames.bin remain.
@@ -230,15 +230,17 @@ final class WALManagerPayloadTests: XCTestCase {
     func testDisablingMemoryModeWritesToDisk() async throws {
         let wal = WALManager(walRoot: walRoot, memoryBackedSessionsEnabled: false)
         var session = try await wal.createSession(videoID: VideoSegmentID(value: 8))
-        try await wal.appendFrame(Self.makeGradientFrame(width: 64, height: 64, seed: 5), to: &session)
+        try await wal.appendFrame(Self.makeScreenLikeFrame(width: 64, height: 64, seed: 5), to: &session)
         XCTAssertGreaterThan(try Self.fileSize(session.framesURL), 0, "disk-backed mode must write frames.bin")
     }
 
     // MARK: - Helpers
 
-    /// Smooth BGRA gradient: compresses well with low JPEG error, and its size
-    /// (64x64x4 = 16KB) is large enough that the JPEG is smaller than raw.
-    private static func makeGradientFrame(width: Int, height: Int, seed: UInt8) -> CapturedFrame {
+    /// Screen-like BGRA content: a flat background with a solid "window" block and
+    /// striped "text" lines inside it, i.e. long runs of identical pixels. That is
+    /// what a lossless codec compresses (real captures shrink ~5-7x under LZ4); a
+    /// smooth per-pixel gradient has no byte repeats and would be stored raw.
+    private static func makeScreenLikeFrame(width: Int, height: Int, seed: UInt8) -> CapturedFrame {
         let bytesPerRow = width * 4
         var data = Data(count: bytesPerRow * height)
         data.withUnsafeMutableBytes { buffer in
@@ -246,10 +248,13 @@ final class WALManagerPayloadTests: XCTestCase {
             for y in 0..<height {
                 for x in 0..<width {
                     let offset = y * bytesPerRow + x * 4
-                    base[offset] = UInt8(min(255, x * 4))     // B
-                    base[offset + 1] = UInt8(min(255, y * 4)) // G
-                    base[offset + 2] = seed                   // R
-                    base[offset + 3] = 255                    // A
+                    let inWindow = x >= width / 4 && x < width * 3 / 4 && y >= height / 4 && y < height * 3 / 4
+                    let onTextLine = inWindow && y % 4 == 0
+                    let shade: UInt8 = onTextLine ? 20 : (inWindow ? 240 : 60)
+                    base[offset] = shade                        // B
+                    base[offset + 1] = shade                    // G
+                    base[offset + 2] = inWindow ? shade : seed  // R (seed tints the background)
+                    base[offset + 3] = 255                      // A
                 }
             }
         }
@@ -267,6 +272,14 @@ final class WALManagerPayloadTests: XCTestCase {
                 displayID: 1
             )
         )
+    }
+
+    /// Random BGRA bytes: LZ4 cannot shrink these (and the signature adds 4 bytes),
+    /// so the frame is guaranteed to be stored raw at exactly width*4*height bytes.
+    private static func makeIncompressibleFrame(width: Int, height: Int) -> CapturedFrame {
+        let bytesPerRow = width * 4
+        let data = Data((0..<(bytesPerRow * height)).map { _ in UInt8.random(in: 0...255) })
+        return CapturedFrame(imageData: data, width: width, height: height, bytesPerRow: bytesPerRow)
     }
 
     /// Writes a record in the legacy layout: 36-byte header (native endianness,
