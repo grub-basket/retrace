@@ -32,7 +32,7 @@ final class WALManagerCompressedPayloadTests: XCTestCase {
         let wal = WALManager(walRoot: walRoot)
         var session = try await wal.createSession(videoID: VideoSegmentID(value: 1))
         // Padded stride on purpose: lossless storage must preserve it exactly.
-        let frame = Self.makeGradientFrame(width: 64, height: 64, bytesPerRow: 64 * 4 + 16, seed: 30)
+        let frame = Self.makeScreenLikeFrame(width: 64, height: 64, bytesPerRow: 64 * 4 + 16, seed: 30)
 
         try await wal.appendFrame(frame, to: &session)
 
@@ -116,17 +116,24 @@ final class WALManagerCompressedPayloadTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private static func makeGradientFrame(width: Int, height: Int, bytesPerRow: Int, seed: UInt8) -> CapturedFrame {
+    /// Screen-like BGRA content: a flat background with a solid "window" block and
+    /// striped "text" lines inside it, i.e. long runs of identical pixels. That is
+    /// what a lossless codec compresses (real captures shrink ~5-7x under LZ4); a
+    /// smooth per-pixel gradient has no byte repeats and would be stored raw.
+    private static func makeScreenLikeFrame(width: Int, height: Int, bytesPerRow: Int, seed: UInt8) -> CapturedFrame {
         var data = Data(count: bytesPerRow * height)
         data.withUnsafeMutableBytes { buffer in
             let base = buffer.bindMemory(to: UInt8.self).baseAddress!
             for y in 0..<height {
                 for x in 0..<width {
                     let offset = y * bytesPerRow + x * 4
-                    base[offset] = UInt8(min(255, x * 4))     // B
-                    base[offset + 1] = UInt8(min(255, y * 4)) // G
-                    base[offset + 2] = seed                   // R
-                    base[offset + 3] = 255                    // A
+                    let inWindow = x >= width / 4 && x < width * 3 / 4 && y >= height / 4 && y < height * 3 / 4
+                    let onTextLine = inWindow && y % 4 == 0
+                    let shade: UInt8 = onTextLine ? 20 : (inWindow ? 240 : 60)
+                    base[offset] = shade                        // B
+                    base[offset + 1] = shade                    // G
+                    base[offset + 2] = inWindow ? shade : seed  // R (seed tints the background)
+                    base[offset + 3] = 255                      // A
                 }
             }
         }
